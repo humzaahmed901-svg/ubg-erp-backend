@@ -1,8 +1,10 @@
 // server.js
+
 import express from "express";
 import dotenv from "dotenv";
 import helmet from "helmet";
 import compression from "compression";
+import cors from "cors";
 import cookieParser from "cookie-parser";
 import rateLimit from "express-rate-limit";
 import bcrypt from "bcrypt";
@@ -24,16 +26,21 @@ if (process.env.NODE_ENV === "production") {
 
 app.use(helmet());
 app.use(compression());
+
+app.use(cors({
+    origin: true,
+    credentials: true
+}));
+
 app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: false }));
 app.use(cookieParser());
 
 const pool = new Pool({
-    host: process.env.PGHOST,
-    port: Number(process.env.PGPORT || 5432),
-    database: process.env.PGDATABASE,
-    user: process.env.PGUSER,
-    password: process.env.PGPASSWORD,
+    connectionString: process.env.DATABASE_URL,
+    ssl: {
+        rejectUnauthorized: false
+    },
     max: 10
 });
 
@@ -160,7 +167,6 @@ async function initDB() {
                 REFERENCES articles(id)
                 ON DELETE SET NULL,
 
-            /* Article snapshot */
             article_name VARCHAR(160),
             article_code VARCHAR(100),
             size VARCHAR(50),
@@ -230,7 +236,6 @@ async function initDB() {
                 REFERENCES articles(id)
                 ON DELETE SET NULL,
 
-            /* Article snapshot */
             article_name VARCHAR(160) NOT NULL,
             article_code VARCHAR(100) NOT NULL,
             size VARCHAR(50),
@@ -290,10 +295,6 @@ async function initDB() {
        ARTICLE DELETE / HISTORY MIGRATION
        ===================================================== */
 
-    /*
-       Purchase history ke liye article snapshot columns.
-    */
-
     await q(`
         ALTER TABLE purchases
         ADD COLUMN IF NOT EXISTS article_name VARCHAR(160),
@@ -301,12 +302,6 @@ async function initDB() {
         ADD COLUMN IF NOT EXISTS size VARCHAR(50),
         ADD COLUMN IF NOT EXISTS colour VARCHAR(80)
     `);
-
-
-    /*
-       Existing purchases ke article details ko snapshot
-       columns mein copy karo.
-    */
 
     await q(`
         UPDATE purchases p
@@ -322,12 +317,6 @@ async function initDB() {
               OR p.article_code IS NULL
           )
     `);
-
-
-    /*
-       purchases article foreign key ko
-       ON DELETE SET NULL karo.
-    */
 
     await q(`
         ALTER TABLE purchases
@@ -347,13 +336,6 @@ async function initDB() {
         ON DELETE SET NULL
     `);
 
-
-    /*
-       sale_items article foreign key ko bhi
-       ON DELETE SET NULL karo.
-       Sale item mein article snapshot already stored hai.
-    */
-
     await q(`
         ALTER TABLE sale_items
         DROP CONSTRAINT IF EXISTS sale_items_article_id_fkey
@@ -372,21 +354,17 @@ async function initDB() {
         ON DELETE SET NULL
     `);
 
-
     await ensureAdmin();
 }
-
-
 async function ensureAdmin() {
 
-    const admin = await q(
-        `SELECT id FROM users WHERE role='admin' LIMIT 1`
+    const username = String(
+        process.env.ADMIN_USERNAME || "admin"
+    ).trim();
+
+    const password = String(
+        process.env.ADMIN_PASSWORD || "admin123"
     );
-
-    if (admin.rowCount) return;
-
-    const username = process.env.ADMIN_USERNAME;
-    const password = process.env.ADMIN_PASSWORD;
 
     if (!username || !password) {
         console.log(
@@ -395,22 +373,69 @@ async function ensureAdmin() {
         return;
     }
 
-    const hash =
-        await bcrypt.hash(password, 12);
+    const hash = await bcrypt.hash(
+        password,
+        12
+    );
 
+    // Existing admin check
+    const admin = await q(
+        `SELECT id
+         FROM users
+         WHERE role='admin'
+         ORDER BY id
+         LIMIT 1`
+    );
+
+    if (admin.rowCount) {
+
+        // Sync existing admin credentials
+        await q(
+            `UPDATE users
+             SET
+                username=$1,
+                password_hash=$2,
+                role='admin'
+             WHERE id=$3`,
+            [
+                username,
+                hash,
+                admin.rows[0].id
+            ]
+        );
+
+        console.log(
+            `Admin credentials synchronized: ${username}`
+        );
+
+        return;
+    }
+
+    // Create admin if none exists
     await q(
         `INSERT INTO users
-         (username,password_hash,role)
-         VALUES($1,$2,'admin')
-         ON CONFLICT(username) DO NOTHING`,
-        [username, hash]
+         (username, password_hash, role)
+         VALUES($1, $2, 'admin')
+         ON CONFLICT(username)
+         DO UPDATE SET
+            password_hash=EXCLUDED.password_hash,
+            role='admin'`,
+        [
+            username,
+            hash
+        ]
     );
 
     console.log(
-        `Admin bootstrap checked: ${username}`
+        `Admin created: ${username}`
     );
 }
 
+ 
+  
+
+    
+  
 
 /* =========================================================
    AUTH
@@ -918,13 +943,6 @@ app.put(
 );
 
 
-/*
-   IMPORTANT:
-   Article ab permanently delete ho sakta hai.
-   Purchase aur Sale history foreign key ki wajah
-   se delete nahi hogi.
-*/
-
 app.delete(
     "/api/articles/:id",
     auth,
@@ -1243,10 +1261,7 @@ app.delete(
             message: "Supplier deleted."
         });
     })
-);
-
-
-/* =========================================================
+);/* =========================================================
    PURCHASES
    ========================================================= */
 
@@ -1337,10 +1352,6 @@ app.post(
             }
 
 
-            /* ==========================================
-               SUPPLIER
-               ========================================== */
-
             let supplierName = null;
 
             if (String(
@@ -1373,64 +1384,40 @@ app.post(
             }
 
 
-            /* ==========================================
-               PURCHASE WITH ARTICLE SNAPSHOT
-               ========================================== */
-
             const purchase =
                 await client.query(`
                     INSERT INTO purchases
                     (
                         article_id,
-
                         article_name,
                         article_code,
                         size,
                         colour,
-
                         quantity,
                         purchase_price,
-
                         supplier_id,
                         supplier_name,
-
                         created_by
                     )
                     VALUES
                     (
-                        $1,
-                        $2,
-                        $3,
-                        $4,
-                        $5,
-                        $6,
-                        $7,
-                        $8,
-                        $9,
-                        $10
+                        $1,$2,$3,$4,$5,
+                        $6,$7,$8,$9,$10
                     )
                     RETURNING *
                 `, [
                     article.rows[0].id,
-
                     article.rows[0].article_name,
                     article.rows[0].article_code,
                     article.rows[0].size,
                     article.rows[0].colour,
-
                     qty,
                     price,
-
                     req.body.supplier_id || null,
                     supplierName,
-
                     req.user.id
                 ]);
 
-
-            /* ==========================================
-               UPDATE STOCK
-               ========================================== */
 
             await client.query(`
                 UPDATE articles
@@ -1576,8 +1563,6 @@ app.post(
                 );
             }
 
-
-            /* Merge duplicate article lines */
 
             const map = new Map();
 
@@ -1880,23 +1865,15 @@ app.post(
                 const a =
                     item.article;
 
-
-                /*
-                   Article snapshot sale_items mein
-                   already save ho raha hai.
-                */
-
                 await client.query(`
                     INSERT INTO sale_items
                     (
                         sale_id,
                         article_id,
-
                         article_name,
                         article_code,
                         size,
                         colour,
-
                         quantity,
                         rate,
                         line_total
@@ -1907,14 +1884,11 @@ app.post(
                     )
                 `, [
                     saleId,
-
                     a.id,
-
                     a.article_name,
                     a.article_code,
                     a.size,
                     a.colour,
-
                     item.quantity,
                     item.rate,
                     item.line_total
@@ -2320,11 +2294,6 @@ app.get(
                 ORDER BY created_at DESC
                 LIMIT 5
             `),
-
-            /*
-               LEFT JOIN + snapshot fields
-               means deleted articles remain visible.
-            */
 
             q(`
                 SELECT
